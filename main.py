@@ -3,74 +3,117 @@ import pandas as pd
 import pandas_ta as ta
 from sklearn.ensemble import RandomForestRegressor
 import numpy as np
+import sys
 
 # 1. Fetch Data
-ticker = "TSLA"
-# 5m interval is available for up to 60 days
+ticker = sys.argv[1].upper() if len(sys.argv) > 1 else "TSLA"
 df = yf.download(ticker, interval="5m", period="60d")
 
 if df.empty:
     print(f"No data found for {ticker}. Please check the ticker symbol or market status.")
     exit()
 
-# Flatten MultiIndex columns if necessary (common in newer yfinance versions)
 if isinstance(df.columns, pd.MultiIndex):
     df.columns = df.columns.get_level_values(0)
 
-print(f"Fetched {len(df)} data points for {ticker}")
-
-# 2. Feature Engineering with pandas_ta
-df['RSI'] = ta.rsi(df['Close'], length=14)
+# 2. Feature Engineering
+# Moving Averages
+df['EMA_9'] = ta.ema(df['Close'], length=9)
+df['EMA_21'] = ta.ema(df['Close'], length=21)
 df['SMA_20'] = ta.sma(df['Close'], length=20)
 df['SMA_50'] = ta.sma(df['Close'], length=50)
+df['SMA_200'] = ta.sma(df['Close'], length=200)
+
+# Indicators
+df['RSI'] = ta.rsi(df['Close'], length=14)
 df['PCT_Change'] = df['Close'].pct_change()
 
-# Define the prediction horizons (in 5-minute increments)
-# 5 mins = 1 step, 15 mins = 3 steps, 30 mins = 6 steps, 60 mins = 12 steps
-horizons = {
-    "5 mins": 1,
-    "15 mins": 3,
-    "30 mins": 6,
-    "60 mins": 12
-}
+# Define horizons
+horizons = {"5m": 1, "15m": 3, "30m": 6, "60m": 12}
+feature_cols = ['RSI', 'EMA_9', 'EMA_21', 'SMA_50', 'Close']
 
-# Features (X)
-feature_cols = ['RSI', 'SMA_20', 'SMA_50', 'Close']
-
-# 3. Clean and Train
-print(f"--- {ticker} Multi-Horizon Analysis ---")
+print(f"--- {ticker} Technical & AI Analysis ---")
 actual_now = df['Close'].iloc[-1]
-print(f"Current Price: ${actual_now:.2f}")
-print(f"Current RSI: {df['RSI'].iloc[-1]:.2f}")
-print("-" * 30)
+rsi_now = df['RSI'].iloc[-1]
+ema9 = df['EMA_9'].iloc[-1]
+ema21 = df['EMA_21'].iloc[-1]
+sma50 = df['SMA_50'].iloc[-1]
+sma200 = df['SMA_200'].iloc[-1]
 
-# We'll store the models and predictions
+# 3. Calculate Signals
+signals = []
+score = 0 # -5 to +5 scale
+
+# EMA 9/21 Cross
+if ema9 > ema21:
+    signals.append("EMA 9/21: BULLISH (Crossover Up)")
+    score += 1
+else:
+    signals.append("EMA 9/21: BEARISH (Crossover Down)")
+    score -= 1
+
+# Price vs SMA 50
+if actual_now > sma50:
+    signals.append("Price vs SMA 50: BULLISH (Above Trend)")
+    score += 1
+else:
+    signals.append("Price vs SMA 50: BEARISH (Below Trend)")
+    score -= 1
+
+# RSI Context
+if rsi_now < 30:
+    signals.append("RSI: OVERSOLD (Potential Buy)")
+    score += 1.5
+elif rsi_now > 70:
+    signals.append("RSI: OVERBOUGHT (Potential Sell)")
+    score -= 1.5
+else:
+    signals.append(f"RSI: NEUTRAL ({rsi_now:.2f})")
+
+# 4. AI Predictions
+ai_predictions = {}
 for label, steps in horizons.items():
-    # Create target for this specific horizon
     df_temp = df.copy()
     df_temp['Target'] = df_temp['Close'].shift(-steps)
-    
-    # Drop NaNs for this specific training set
     df_temp = df_temp.dropna(subset=feature_cols + ['Target'])
     
-    if len(df_temp) < 100:
-        print(f"Not enough data to train for {label}")
-        continue
+    if len(df_temp) < 100: continue
 
     X = df_temp[feature_cols]
     y = df_temp['Target']
 
-    # Train Model
     model = RandomForestRegressor(n_estimators=100, random_state=42)
     model.fit(X, y)
 
     # Predict for the very latest data point
-    current_features = np.array(df[feature_cols].iloc[-1]).reshape(1, -1)
-    prediction = model.predict(current_features)[0]
+    current_features = df[feature_cols].iloc[[-1]]
+    pred = model.predict(current_features)[0]
+    ai_predictions[label] = pred
     
-    diff = prediction - actual_now
-    signal = "BULLISH" if diff > 0 and df['RSI'].iloc[-1] < 70 else "BEARISH/NEUTRAL"
-    
-    print(f"Prediction for {label}: ${prediction:.2f} ({diff:+.2f}) -> {signal}")
+    # AI Score weighting
+    if pred > actual_now: score += 0.5
+    else: score -= 0.5
 
-print("-" * 30)
+# 5. Final Rating Logic
+rating = "NEUTRAL"
+if score >= 3: rating = "STRONG BUY"
+elif 1 <= score < 3: rating = "BUY"
+elif -1 < score <= -3: rating = "SELL"
+elif score <= -3: rating = "STRONG SELL"
+
+# 6. Output
+print(f"Current Price: ${actual_now:.2f}")
+print("-" * 40)
+print("TECHNICAL SIGNALS:")
+for s in signals: print(f"  [>] {s}")
+print(f"  [>] SMA 200: ${sma200:.2f} (Long-term Anchor)")
+
+print("-" * 40)
+print("AI PRICE PREDICTIONS:")
+for label, pred in ai_predictions.items():
+    diff = pred - actual_now
+    print(f"  [~] {label}: ${pred:.2f} ({diff:+.2f})")
+
+print("-" * 40)
+print(f"OVERALL RATING: {rating} (Score: {score:+.1f})")
+print("-" * 40)
