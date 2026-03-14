@@ -10,110 +10,115 @@ ticker = sys.argv[1].upper() if len(sys.argv) > 1 else "TSLA"
 df = yf.download(ticker, interval="5m", period="60d")
 
 if df.empty:
-    print(f"No data found for {ticker}. Please check the ticker symbol or market status.")
+    print(f"No data found for {ticker}.")
     exit()
 
 if isinstance(df.columns, pd.MultiIndex):
     df.columns = df.columns.get_level_values(0)
 
-# 2. Feature Engineering
-# Moving Averages
+# 2. Enhanced Feature Engineering
+# Trend & Momentum
 df['EMA_9'] = ta.ema(df['Close'], length=9)
 df['EMA_21'] = ta.ema(df['Close'], length=21)
-df['SMA_20'] = ta.sma(df['Close'], length=20)
 df['SMA_50'] = ta.sma(df['Close'], length=50)
 df['SMA_200'] = ta.sma(df['Close'], length=200)
-
-# Indicators
 df['RSI'] = ta.rsi(df['Close'], length=14)
-df['PCT_Change'] = df['Close'].pct_change()
 
-# Define horizons
+# Volatility & Volume
+df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+df['VWAP'] = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume'])
+df['VOL_SMA'] = ta.sma(df['Volume'], length=20)
+
+# MACD
+macd = ta.macd(df['Close'])
+df = pd.concat([df, macd], axis=1) # Adds MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
+
+# Define horizons and features for AI
 horizons = {"5m": 1, "15m": 3, "30m": 6, "60m": 12}
-feature_cols = ['RSI', 'EMA_9', 'EMA_21', 'SMA_50', 'Close']
+# Use MACD Histogram and VWAP in the AI features
+feature_cols = ['RSI', 'EMA_9', 'EMA_21', 'SMA_50', 'Close', 'VWAP', 'MACDh_12_26_9']
 
-print(f"--- {ticker} Technical & AI Analysis ---")
-actual_now = df['Close'].iloc[-1]
-rsi_now = df['RSI'].iloc[-1]
-ema9 = df['EMA_9'].iloc[-1]
-ema21 = df['EMA_21'].iloc[-1]
-sma50 = df['SMA_50'].iloc[-1]
-sma200 = df['SMA_200'].iloc[-1]
+print(f"--- {ticker} High-Confidence Analysis ---")
+now = df.iloc[-1]
+actual_now = now['Close']
+vol_ratio = now['Volume'] / now['VOL_SMA']
 
-# 3. Calculate Signals
-signals = []
-score = 0 # -5 to +5 scale
+# 3. Confidence & Signal Scoring
+score = 0
+reasons = []
 
-# EMA 9/21 Cross
-if ema9 > ema21:
-    signals.append("EMA 9/21: BULLISH (Crossover Up)")
-    score += 1
-else:
-    signals.append("EMA 9/21: BEARISH (Crossover Down)")
-    score -= 1
-
-# Price vs SMA 50
-if actual_now > sma50:
-    signals.append("Price vs SMA 50: BULLISH (Above Trend)")
-    score += 1
-else:
-    signals.append("Price vs SMA 50: BEARISH (Below Trend)")
-    score -= 1
-
-# RSI Context
-if rsi_now < 30:
-    signals.append("RSI: OVERSOLD (Potential Buy)")
+# A. VWAP Analysis (The Day Trader's Anchor)
+if actual_now > now['VWAP']:
     score += 1.5
-elif rsi_now > 70:
-    signals.append("RSI: OVERBOUGHT (Potential Sell)")
-    score -= 1.5
+    reasons.append("Price > VWAP (Bullish Bias)")
 else:
-    signals.append(f"RSI: NEUTRAL ({rsi_now:.2f})")
+    score -= 1.5
+    reasons.append("Price < VWAP (Bearish Bias)")
+
+# B. MACD Momentum
+if now['MACDh_12_26_9'] > 0:
+    score += 1
+    reasons.append("MACD Histogram Positive (Improving Momentum)")
+else:
+    score -= 1
+    reasons.append("MACD Histogram Negative (Declining Momentum)")
+
+# C. Volume Confirmation
+volume_confirmed = vol_ratio > 1.2 # 20% above average
+if volume_confirmed:
+    # Volume amplifies the existing score
+    score *= 1.2
+    reasons.append(f"High Volume Confirmation ({vol_ratio:.1f}x avg)")
+
+# D. Standard EMA/SMA Checks
+if now['EMA_9'] > now['EMA_21']: score += 0.5
+if actual_now > now['SMA_50']: score += 0.5
 
 # 4. AI Predictions
-ai_predictions = {}
+ai_preds = []
 for label, steps in horizons.items():
-    df_temp = df.copy()
-    df_temp['Target'] = df_temp['Close'].shift(-steps)
-    df_temp = df_temp.dropna(subset=feature_cols + ['Target'])
+    df_t = df.copy()
+    df_t['Target'] = df_t['Close'].shift(-steps)
+    df_t = df_t.dropna(subset=feature_cols + ['Target'])
     
-    if len(df_temp) < 100: continue
-
-    X = df_temp[feature_cols]
-    y = df_temp['Target']
-
+    if len(df_t) < 500: continue
+    
     model = RandomForestRegressor(n_estimators=100, random_state=42)
-    model.fit(X, y)
-
-    # Predict for the very latest data point
-    current_features = df[feature_cols].iloc[[-1]]
-    pred = model.predict(current_features)[0]
-    ai_predictions[label] = pred
+    model.fit(df_t[feature_cols], df_t['Target'])
     
-    # AI Score weighting
-    if pred > actual_now: score += 0.5
-    else: score -= 0.5
+    pred = model.predict(df[feature_cols].iloc[[-1]])[0]
+    ai_preds.append((label, pred))
+    if pred > actual_now: score += 0.25
+    else: score -= 0.25
 
-# 5. Final Rating Logic
+# 5. Determine Rating & Confidence
+# Confidence is based on indicator agreement and volume
+agreement_ratio = len([r for r in reasons if "Bullish" in r or "Positive" in r]) / len(reasons)
+confidence = "LOW"
+if volume_confirmed and (agreement_ratio > 0.8 or agreement_ratio < 0.2):
+    confidence = "HIGH"
+elif volume_confirmed or (0.7 > agreement_ratio > 0.3):
+    confidence = "MEDIUM"
+
 rating = "NEUTRAL"
-if score >= 3: rating = "STRONG BUY"
-elif 1 <= score < 3: rating = "BUY"
-elif -1 < score <= -3: rating = "SELL"
-elif score <= -3: rating = "STRONG SELL"
+if score >= 4: rating = "STRONG BUY"
+elif 1.5 <= score < 4: rating = "BUY"
+elif -1.5 < score <= -4: rating = "SELL"
+elif score <= -4: rating = "STRONG SELL"
 
 # 6. Output
-print(f"Current Price: ${actual_now:.2f}")
-print("-" * 40)
-print("TECHNICAL SIGNALS:")
-for s in signals: print(f"  [>] {s}")
-print(f"  [>] SMA 200: ${sma200:.2f} (Long-term Anchor)")
+print(f"Current Price: ${actual_now:.2f} | VWAP: ${now['VWAP']:.2f}")
+print(f"Volatility (ATR): ${now['ATR']:.2f}")
+print("-" * 50)
+print(f"CONFIDENCE LEVEL: {confidence}")
+print(f"OVERALL RATING:   {rating} (Score: {score:+.1f})")
+print("-" * 50)
+print("CONFIRMING FACTORS:")
+for r in reasons: print(f"  [>] {r}")
 
-print("-" * 40)
-print("AI PRICE PREDICTIONS:")
-for label, pred in ai_predictions.items():
+print("-" * 50)
+print("AI PRICE TARGETS:")
+for label, pred in ai_preds:
     diff = pred - actual_now
-    print(f"  [~] {label}: ${pred:.2f} ({diff:+.2f})")
-
-print("-" * 40)
-print(f"OVERALL RATING: {rating} (Score: {score:+.1f})")
-print("-" * 40)
+    print(f"  [~] {label} Target: ${pred:.2f} ({diff:+.2f})")
+print("-" * 50)
